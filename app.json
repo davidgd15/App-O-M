@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "AppLeituraCod",
-    "slug": "AppLeituraCod",
+    "name": "Modulos SN",
+    "slug": "leitura-modulos",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -21,10 +21,17 @@
         "backgroundColor": "#ffffff"
       },
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "package": "com.santorinisorganization.leituramodulos"
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "dbffc33f-2b1b-4929-b4e1-b1ae5b78ccf4"
+      }
+    },
+    "owner": "santorinis-organization"
   }
 }
