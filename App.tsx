@@ -524,7 +524,7 @@ const AppNavigator = () => (
       tabBarIcon: () => null,
       headerShown: true,
       tabBarLabelStyle: { fontSize: 18, fontWeight: 'bold' },
-      tabBarStyle: { height: 70, paddingBottom: 0, paddingTop: 0 },
+      tabBarStyle: { height: 130, paddingBottom: 0, paddingTop: 0 },
       tabBarItemStyle: { marginTop: -20 },
     }}
   >
