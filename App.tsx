@@ -371,6 +371,24 @@ const CurrentBatchScreen = ({ navigation }: any) => {
 
   return (
     <View style={styles.screen}>
+
+      <View style={styles.codeInputContainer}>
+        <TextInput
+          ref={inputRef}
+          style={styles.codeInput}
+          placeholder="Código (apenas números)"
+          keyboardType="numeric"
+          maxLength={14}
+          value={codeInput}
+          onChangeText={setCodeInput}
+          onSubmitEditing={handleAddCode}
+          autoCapitalize="none"
+          autoCorrect={false}
+          editable={true}
+        />
+        <Button title="Adicionar" onPress={handleAddCode} disabled={isFull} />
+      </View>
+
       {/* Primeira linha: criar lote ou mostrar lote atual + cancelar */}
       <View style={styles.headerRow}>
         {hasActiveBatch ? (
@@ -389,22 +407,7 @@ const CurrentBatchScreen = ({ navigation }: any) => {
         <Button title="Sincronizar" onPress={() => syncPendingBatches()} />
       </View>
 
-      <View style={styles.codeInputContainer}>
-        <TextInput
-          ref={inputRef}
-          style={styles.codeInput}
-          placeholder="Código (apenas números)"
-          keyboardType="numeric"
-          maxLength={14}
-          value={codeInput}
-          onChangeText={setCodeInput}
-          onSubmitEditing={handleAddCode}
-          autoCapitalize="none"
-          autoCorrect={false}
-          editable={true}
-        />
-        <Button title="Adicionar" onPress={handleAddCode} disabled={isFull} />
-      </View>
+
 
       {currentModules.length > 0 && (
         <>
