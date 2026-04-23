@@ -2,9 +2,9 @@
   "expo": {
     "name": "Modulos SN",
     "slug": "leitura-modulos",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
+    "icon": "./assets/icone.png",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
     "splash": {
