@@ -413,7 +413,7 @@ const CurrentBatchScreen = ({ navigation }: any) => {
         <>
           <Text style={styles.tableTitle}>Módulos inseridos</Text>
           <FlatList
-            data={currentModules}
+            data={[...currentModules].reverse()}
             keyExtractor={(item) => item.id.toString()}
             renderItem={({ item }) => (
               <View style={styles.tableRow}>
