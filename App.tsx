@@ -10,6 +10,7 @@ import {
   View,
   ActivityIndicator,
 } from 'react-native';
+import { Picker } from '@react-native-picker/picker';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
@@ -17,22 +18,37 @@ import { db } from './firebaseConfig';
 import { collection, query, orderBy, onSnapshot, addDoc } from 'firebase/firestore';
 import NetInfo from '@react-native-community/netinfo';
 
-// ---------- Função para formatar data/hora ----------
-const formatDateTime = (date: Date): string => {
-  const formatter = new Intl.DateTimeFormat('pt-BR', {
-    timeZone: 'America/Sao_Paulo',
-    day: '2-digit',
-    month: '2-digit',
-    year: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
-  });
-  return formatter.format(date);
+// ==================== CONSTANTES ====================
+const USINAS = ['GD-1', 'GD-2', 'GD-3', 'GD-4', 'PARAOPEBA-1', 'PARAOPEBA-2'];
+
+const SUBAREAS: Record<string, string[]> = {
+  'GD-1': ['UFV 1', 'UFV 2', 'UFV 3'],
+  'GD-2': ['UFV 1', 'UFV 2', 'UFV 3'],
+  'GD-3': ['UFV 1', 'UFV 2', 'UFV 3'],
+  'GD-4': ['UFV 1', 'UFV 2', 'UFV 3'],
+  'PARAOPEBA-1': ['A', 'B', 'C'],
+  'PARAOPEBA-2': ['A', 'B', 'C'],
 };
 
-// ---------- Tipagens ----------
+const MAX_MODULES: Record<string, number> = {
+  'GD-1': 30,
+  'GD-2': 30,
+  'GD-3': 45,
+  'GD-4': 45,
+  'PARAOPEBA-1': 30,
+  'PARAOPEBA-2': 30,
+};
+
+// Gera o nome da coleção: GD-1-UFV-1, GD-1-UFV-2, etc.
+const getCollectionName = (usina: string, subarea: string) =>
+  `${usina}-${subarea.replace(/ /g, '-')}`;
+
+// Lista de todas as coleções que serão escutadas
+const ALL_COLLECTIONS = USINAS.flatMap((usina) =>
+  SUBAREAS[usina].map((sub) => getCollectionName(usina, sub))
+);
+
+// ==================== TIPAGENS ====================
 type Module = {
   id: number;
   code: string;
@@ -42,50 +58,59 @@ type Module = {
 type Batch = {
   id?: string;
   batchId: string;
+  usina: string;
+  subarea: string;
   modules: Module[];
   createdAt: string;
   synced?: boolean;
+  maxModules: number;
 };
 
 type BatchesContextType = {
   batches: Batch[];
   addBatch: (batch: Batch) => Promise<void>;
   loading: boolean;
-  syncPendingBatches: (showAlert?: boolean) => Promise<void>; // alterado
+  syncPendingBatches: (showAlert?: boolean) => Promise<void>;
 };
 
 type CurrentBatchContextType = {
   currentBatchId: string | null;
   currentModules: Module[];
-  createNewBatch: () => Promise<boolean>;
+  currentUsina: string;
+  currentSub: string;
+  currentMaxModules: number;
+  createNewBatch: (usina: string, sub: string, maxModules: number) => Promise<boolean>;
   addModuleToCurrentBatch: (code: string) => Promise<boolean>;
   resetCurrentBatch: () => void;
 };
 
-// ---------- Contextos ----------
+// ==================== CONTEXTOS ====================
 const BatchesContext = createContext<BatchesContextType | undefined>(undefined);
 const CurrentBatchContext = createContext<CurrentBatchContextType | undefined>(undefined);
 
 const useBatches = () => {
   const ctx = useContext(BatchesContext);
-  if (!ctx) throw new Error('useBatches must be used within BatchesProvider');
+  if (!ctx) throw new Error('useBatches deve estar dentro de um BatchesProvider');
   return ctx;
 };
 
 const useCurrentBatch = () => {
   const ctx = useContext(CurrentBatchContext);
-  if (!ctx) throw new Error('useCurrentBatch must be used within CurrentBatchProvider');
+  if (!ctx) throw new Error('useCurrentBatch deve estar dentro de um CurrentBatchProvider');
   return ctx;
 };
 
-// ---------- Provider com suporte offline ----------
+// ==================== PROVIDER ====================
 const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [batches, setBatches] = useState<Batch[]>([]);
   const [currentBatchId, setCurrentBatchId] = useState<string | null>(null);
   const [currentModules, setCurrentModules] = useState<Module[]>([]);
+  const [currentUsina, setCurrentUsina] = useState('');
+  const [currentSub, setCurrentSub] = useState('');
+  const [currentMaxModules, setCurrentMaxModules] = useState(0);
   const [loading, setLoading] = useState(true);
 
-  // Carregar cache local e pendentes ao iniciar
+  // Carrega cache local
   useEffect(() => {
     const loadLocalData = async () => {
       try {
@@ -101,67 +126,88 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     loadLocalData();
   }, []);
 
-  // Escutar Firestore e atualizar cache + remover pendentes já sincronizados
+  // Escuta TODAS as coleções (usina+subárea)
   useEffect(() => {
-    const q = query(collection(db, 'batches'), orderBy('createdAt', 'desc'));
-    const unsubscribe = onSnapshot(q, async (snapshot) => {
-      const firestoreBatches: Batch[] = [];
-      snapshot.forEach((doc) => {
-        const data = doc.data();
-        firestoreBatches.push({
-          id: doc.id,
-          batchId: data.batchId,
-          modules: data.modules,
-          createdAt: data.createdAt,
-          synced: true,
-        });
-      });
-      await AsyncStorage.setItem('@batches_cache', JSON.stringify(firestoreBatches));
+    const unsubscribes: (() => void)[] = [];
 
-      const pendingRaw = await AsyncStorage.getItem('@pending_batches');
-      let pending: Batch[] = pendingRaw ? JSON.parse(pendingRaw) : [];
-      const newPending = pending.filter(p => !firestoreBatches.some(fb => fb.batchId === p.batchId));
-      if (newPending.length !== pending.length) {
-        await AsyncStorage.setItem('@pending_batches', JSON.stringify(newPending));
-        pending = newPending;
-      }
-      setBatches([...pending, ...firestoreBatches]);
-      setLoading(false);
-    }, (error) => {
-      console.error('Erro no snapshot:', error);
-      setLoading(false);
+    ALL_COLLECTIONS.forEach((collectionName) => {
+      const q = query(collection(db, collectionName), orderBy('createdAt', 'desc'));
+      const unsubscribe = onSnapshot(q, async (snapshot) => {
+        const firestoreBatches: Batch[] = [];
+        snapshot.forEach((doc) => {
+          const data = doc.data();
+          firestoreBatches.push({
+            id: doc.id,
+            batchId: data.batchId,
+            usina: data.usina,
+            subarea: data.subarea,
+            modules: data.modules,
+            createdAt: data.createdAt,
+            synced: true,
+            maxModules: data.maxModules,
+          });
+        });
+
+        setBatches((prev) => {
+          // Remove lotes sincronizados dessa coleção e insere os novos
+          const other = prev.filter(
+            (b) =>
+              getCollectionName(b.usina, b.subarea) !== collectionName ||
+              !b.synced
+          );
+          const merged = [...other, ...firestoreBatches];
+          AsyncStorage.setItem(
+            '@batches_cache',
+            JSON.stringify(merged.filter((b) => b.synced))
+          );
+          return merged.sort(
+            (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+          );
+        });
+
+        setLoading(false);
+      });
+
+      unsubscribes.push(unsubscribe);
     });
-    return () => unsubscribe();
+
+    return () => {
+      unsubscribes.forEach((unsub) => unsub());
+    };
   }, []);
 
-  // Salvar lote: tenta enviar ao Firestore, se falhar salva como pendente
+  // Salvar lote na coleção correta
   const addBatch = async (batch: Batch) => {
     const netInfo = await NetInfo.fetch();
     const isConnected = netInfo.isConnected && netInfo.isInternetReachable;
+    const collectionName = getCollectionName(batch.usina, batch.subarea);
 
     if (isConnected) {
       try {
-        await addDoc(collection(db, 'batches'), {
+        await addDoc(collection(db, collectionName), {
           batchId: batch.batchId,
+          usina: batch.usina,
+          subarea: batch.subarea,
           modules: batch.modules,
           createdAt: batch.createdAt,
+          maxModules: batch.maxModules,
         });
-        return; // Sucesso, não salva localmente
+        return;
       } catch (error) {
         console.error('Erro ao salvar no Firebase:', error);
       }
     }
-    // Salvar como pendente
+
     const pendingBatch = { ...batch, synced: false };
     const storedPending = await AsyncStorage.getItem('@pending_batches');
     const pendingList: Batch[] = storedPending ? JSON.parse(storedPending) : [];
     pendingList.push(pendingBatch);
     await AsyncStorage.setItem('@pending_batches', JSON.stringify(pendingList));
-    setBatches(prev => [...prev, pendingBatch]);
+    setBatches((prev) => [...prev, pendingBatch]);
     Alert.alert('Salvo offline', 'Lote será sincronizado quando a conexão voltar.');
   };
 
-  // Sincronizar lotes pendentes (com opção de mostrar alertas)
+  // Sincronizar pendentes
   const syncPendingBatches = async (showAlert: boolean = true): Promise<void> => {
     const netInfo = await NetInfo.fetch();
     if (!netInfo.isConnected || !netInfo.isInternetReachable) {
@@ -177,10 +223,14 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     let successCount = 0;
     for (const batch of pendingList) {
       try {
-        await addDoc(collection(db, 'batches'), {
+        const collectionName = getCollectionName(batch.usina, batch.subarea);
+        await addDoc(collection(db, collectionName), {
           batchId: batch.batchId,
+          usina: batch.usina,
+          subarea: batch.subarea,
           modules: batch.modules,
           createdAt: batch.createdAt,
+          maxModules: batch.maxModules,
         });
         successCount++;
       } catch (error) {
@@ -192,28 +242,35 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     if (showAlert) Alert.alert('Sincronização concluída', `${successCount} lote(s) enviado(s).`);
   };
 
-  // Sincronização automática quando a internet voltar (sem alertas)
+  // Sincronização automática quando a internet voltar
   useEffect(() => {
-    const unsubscribe = NetInfo.addEventListener(state => {
+    const unsubscribe = NetInfo.addEventListener((state) => {
       if (state.isConnected && state.isInternetReachable) {
-        syncPendingBatches(false); // silencioso
+        syncPendingBatches(false);
       }
     });
     return () => unsubscribe();
   }, []);
 
-  // Funções do lote corrente (inalteradas)
-  const createNewBatch = async (): Promise<boolean> => {
-    if (currentBatchId !== null && currentModules.length > 0 && currentModules.length < 30) {
+  // Criar novo lote (batchId por combinação usina+subárea)
+  const createNewBatch = async (usina: string, sub: string, maxModules: number): Promise<boolean> => {
+    if (currentBatchId !== null && currentModules.length > 0 && currentModules.length < currentMaxModules) {
       Alert.alert('Lote em andamento', 'Finalize ou cancele o lote atual antes de criar um novo.');
       return false;
     }
+
+    // batchId sequencial por usina+subárea (baseado no estado local)
+    const relevant = batches.filter((b) => b.usina === usina && b.subarea === sub);
     let nextId = 1;
-    const allBatchIds = batches.map(b => parseInt(b.batchId, 10)).filter(id => !isNaN(id));
-    if (allBatchIds.length > 0) {
-      nextId = Math.max(...allBatchIds) + 1;
+    if (relevant.length > 0) {
+      const ids = relevant.map((b) => parseInt(b.batchId, 10)).filter((id) => !isNaN(id));
+      if (ids.length > 0) nextId = Math.max(...ids) + 1;
     }
+
     setCurrentBatchId(nextId.toString());
+    setCurrentUsina(usina);
+    setCurrentSub(sub);
+    setCurrentMaxModules(maxModules);
     setCurrentModules([]);
     return true;
   };
@@ -223,11 +280,11 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
       Alert.alert('Nenhum lote ativo', 'Clique em "Criar lote" para começar.');
       return false;
     }
-    if (currentModules.length >= 30) {
-      Alert.alert('Lote cheio', 'Este lote já possui 30 módulos.');
+    if (currentModules.length >= currentMaxModules) {
+      Alert.alert('Lote cheio', `Este lote já possui ${currentMaxModules} módulos.`);
       return false;
     }
-    if (currentModules.some(mod => mod.code === code)) {
+    if (currentModules.some((mod) => mod.code === code)) {
       Alert.alert('Código duplicado', 'Este código já foi inserido neste lote.');
       return false;
     }
@@ -237,13 +294,16 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
       code,
       timestamp: formatDateTime(new Date()),
     };
-    setCurrentModules(prev => [...prev, newModule]);
+    setCurrentModules((prev) => [...prev, newModule]);
     return true;
   };
 
   const resetCurrentBatch = () => {
     setCurrentBatchId(null);
     setCurrentModules([]);
+    setCurrentUsina('');
+    setCurrentSub('');
+    setCurrentMaxModules(0);
   };
 
   return (
@@ -252,6 +312,9 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
         value={{
           currentBatchId,
           currentModules,
+          currentUsina,
+          currentSub,
+          currentMaxModules,
           createNewBatch,
           addModuleToCurrentBatch,
           resetCurrentBatch,
@@ -263,33 +326,58 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   );
 };
 
-// ---------- Tela Registrar Módulos ----------
+// ==================== FORMATADOR DE DATA ====================
+const formatDateTime = (date: Date): string => {
+  const formatter = new Intl.DateTimeFormat('pt-BR', {
+    timeZone: 'America/Sao_Paulo',
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  });
+  return formatter.format(date);
+};
+
+// ==================== TELA REGISTRAR MÓDULOS ====================
 const CurrentBatchScreen = ({ navigation }: any) => {
-  const { syncPendingBatches } = useBatches();
+  const { syncPendingBatches, addBatch } = useBatches();
   const {
     currentBatchId,
     currentModules,
+    currentUsina,
+    currentSub,
+    currentMaxModules,
     createNewBatch,
     addModuleToCurrentBatch,
     resetCurrentBatch,
   } = useCurrentBatch();
-  const { addBatch } = useBatches();
 
+  const [selectedUsina, setSelectedUsina] = useState('');
+  const [selectedSub, setSelectedSub] = useState('');
   const [codeInput, setCodeInput] = useState('');
   const inputRef = useRef<TextInput>(null);
-  const isFull = currentModules.length === 30;
+
+  const isFull = currentBatchId !== null && currentModules.length >= currentMaxModules;
   const hasActiveBatch = currentBatchId !== null;
 
   const finalizeBatchWithModules = async (batchId: string, modules: Module[]) => {
     const newBatch: Batch = {
       batchId: batchId,
+      usina: currentUsina,
+      subarea: currentSub,
       modules: modules,
       createdAt: formatDateTime(new Date()),
       synced: false,
+      maxModules: currentMaxModules,
     };
     await addBatch(newBatch);
     resetCurrentBatch();
-    Alert.alert('Lote salvo!', `Lote ${batchId} foi finalizado com sucesso.`);
+    setSelectedUsina('');
+    setSelectedSub('');
+    Alert.alert('Lote salvo!', `Lote ${batchId} finalizado.`);
     navigation.navigate('Módulos');
   };
 
@@ -313,13 +401,13 @@ const CurrentBatchScreen = ({ navigation }: any) => {
       return;
     }
     if (isFull) {
-      Alert.alert('Lote cheio', 'Este lote já está completo. Finalize-o para criar outro.');
+      Alert.alert('Lote cheio', `Este lote já está completo. Finalize-o para criar outro.`);
       setCodeInput('');
       inputRef.current?.focus();
       return;
     }
 
-    const willBeFull = currentModules.length + 1 === 30;
+    const willBeFull = currentModules.length + 1 === currentMaxModules;
     try {
       const success = await addModuleToCurrentBatch(trimmedCode);
       if (success) {
@@ -340,7 +428,7 @@ const CurrentBatchScreen = ({ navigation }: any) => {
       }
     } catch (error) {
       console.error(error);
-      Alert.alert('Erro', 'Ocorreu um erro inesperado. Tente novamente.');
+      Alert.alert('Erro', 'Ocorreu um erro inesperado.');
       setCodeInput('');
       inputRef.current?.focus();
     }
@@ -358,6 +446,8 @@ const CurrentBatchScreen = ({ navigation }: any) => {
             style: 'destructive',
             onPress: () => {
               resetCurrentBatch();
+              setSelectedUsina('');
+              setSelectedSub('');
               setCodeInput('');
             },
           },
@@ -365,92 +455,140 @@ const CurrentBatchScreen = ({ navigation }: any) => {
       );
     } else {
       resetCurrentBatch();
+      setSelectedUsina('');
+      setSelectedSub('');
       setCodeInput('');
     }
   };
 
   return (
     <View style={styles.screen}>
-
-      <View style={styles.codeInputContainer}>
-        <TextInput
-          ref={inputRef}
-          style={styles.codeInput}
-          placeholder="Código (apenas números)"
-          keyboardType="numeric"
-          maxLength={14}
-          value={codeInput}
-          onChangeText={setCodeInput}
-          onSubmitEditing={handleAddCode}
-          autoCapitalize="none"
-          autoCorrect={false}
-          editable={true}
-        />
-        <Button title="Adicionar" onPress={handleAddCode} disabled={isFull} />
+      <Text style={styles.label}>Qual usina você está?</Text>
+      <View style={styles.pickerContainer}>
+        <Picker
+          selectedValue={selectedUsina}
+          onValueChange={(value) => {
+            setSelectedUsina(value);
+            setSelectedSub('');
+          }}
+          enabled={!hasActiveBatch}
+        >
+          <Picker.Item label="Selecione uma usina..." value="" />
+          {USINAS.map((u) => (
+            <Picker.Item key={u} label={u} value={u} />
+          ))}
+        </Picker>
       </View>
 
-      {/* Primeira linha: criar lote ou mostrar lote atual + cancelar */}
-      <View style={styles.headerRow}>
-        {hasActiveBatch ? (
-          <>
-            <Text style={styles.batchLabel}>Lote atual: {currentBatchId}</Text>
-            <Button title="Cancelar lote" onPress={handleCancelBatch} color="#d32f2f" />
-          </>
-        ) : (
-          <Button title="Criar lote" onPress={createNewBatch} />
-        )}
-      </View>
-
-      {/* Segunda linha: contagem e botão sincronizar */}
-      <View style={styles.headerRow}>
-        <Text style={styles.counter}>Módulos: {currentModules.length}/30</Text>
-        <Button title="Sincronizar" onPress={() => syncPendingBatches()} />
-      </View>
-
-
-
-      {currentModules.length > 0 && (
+      {selectedUsina !== '' && (
         <>
-          <Text style={styles.tableTitle}>Módulos inseridos</Text>
-          <FlatList
-            data={[...currentModules].reverse()}
-            keyExtractor={(item) => item.id.toString()}
-            renderItem={({ item }) => (
-              <View style={styles.tableRow}>
-                <Text style={styles.cellId}>{item.id}</Text>
-                <Text style={styles.cellCode}>{item.code}</Text>
-                <Text style={styles.cellDate}>{item.timestamp}</Text>
-              </View>
-            )}
-            ListHeaderComponent={() => (
-              <View style={[styles.tableRow, styles.tableHeader]}>
-                <Text style={styles.cellId}>ID</Text>
-                <Text style={styles.cellCode}>Código</Text>
-                <Text style={styles.cellDate}>Data/Hora</Text>
-              </View>
-            )}
-          />
+          <Text style={styles.label}>Selecione a subárea:</Text>
+          <View style={styles.pickerContainer}>
+            <Picker
+              selectedValue={selectedSub}
+              onValueChange={setSelectedSub}
+              enabled={!hasActiveBatch}
+            >
+              <Picker.Item label="Selecione..." value="" />
+              {SUBAREAS[selectedUsina]?.map((sub) => (
+                <Picker.Item key={sub} label={sub} value={sub} />
+              ))}
+            </Picker>
+          </View>
         </>
       )}
 
-      {isFull && hasActiveBatch && (
-        <View style={styles.finishButton}>
-          <Button title="Finalizar Lote" onPress={() => finalizeBatchWithModules(currentBatchId!, currentModules)} />
-        </View>
+      {!hasActiveBatch && selectedUsina !== '' && selectedSub !== '' && (
+        <Button
+          title="Criar lote"
+          onPress={() => createNewBatch(selectedUsina, selectedSub, MAX_MODULES[selectedUsina])}
+        />
+      )}
+
+      {hasActiveBatch && (
+        <>
+          <View style={styles.codeInputContainer}>
+            <TextInput
+              ref={inputRef}
+              style={styles.codeInput}
+              placeholder="Código (14 números)"
+              keyboardType="numeric"
+              maxLength={14}
+              value={codeInput}
+              onChangeText={setCodeInput}
+              onSubmitEditing={handleAddCode}
+            />
+            <Button title="Adicionar" onPress={handleAddCode} disabled={isFull} />
+          </View>
+
+          <View style={styles.headerRow}>
+            <Text style={styles.batchLabel}>Lote: {currentBatchId}</Text>
+            <Text style={styles.usinaLabel}>{currentUsina} - {currentSub}</Text>
+            <Button title="Cancelar lote" onPress={handleCancelBatch} color="#d32f2f" />
+          </View>
+
+          <View style={styles.headerRow}>
+            <Text style={styles.counter}>
+              Módulos: {currentModules.length}/{currentMaxModules}
+            </Text>
+            <Button title="Sincronizar" onPress={() => syncPendingBatches()} />
+          </View>
+
+          {currentModules.length > 0 && (
+            <>
+              <Text style={styles.tableTitle}>Módulos inseridos</Text>
+              <FlatList
+                data={[...currentModules].reverse()}
+                keyExtractor={(item) => item.id.toString()}
+                renderItem={({ item }) => (
+                  <View style={styles.tableRow}>
+                    <Text style={styles.cellId}>{item.id}</Text>
+                    <Text style={styles.cellCode}>{item.code}</Text>
+                    <Text style={styles.cellDate}>{item.timestamp}</Text>
+                  </View>
+                )}
+                ListHeaderComponent={() => (
+                  <View style={[styles.tableRow, styles.tableHeader]}>
+                    <Text style={styles.cellId}>ID</Text>
+                    <Text style={styles.cellCode}>Código</Text>
+                    <Text style={styles.cellDate}>Data/Hora</Text>
+                  </View>
+                )}
+              />
+            </>
+          )}
+
+          {isFull && (
+            <View style={styles.finishButton}>
+              <Button title="Finalizar Lote" onPress={() => finalizeBatchWithModules(currentBatchId!, currentModules)} />
+            </View>
+          )}
+        </>
       )}
     </View>
   );
 };
 
-// ---------- Tela Módulos ----------
+// ==================== TELA MÓDULOS ====================
 const ModulesScreen = () => {
   const { batches, loading, syncPendingBatches } = useBatches();
-  const [modalVisible, setModalVisible] = useState(false);
+  const [usinaModalVisible, setUsinaModalVisible] = useState(false);
+  const [selectedUsina, setSelectedUsina] = useState('');
+  const [loteModalVisible, setLoteModalVisible] = useState(false);
   const [selectedBatch, setSelectedBatch] = useState<Batch | null>(null);
 
-  const openDetails = (batch: Batch) => {
+  const batchesDaUsina = selectedUsina
+    ? batches.filter((b) => b.usina === selectedUsina)
+    : [];
+
+  const openUsinaLotes = (usina: string) => {
+    setSelectedUsina(usina);
+    setUsinaModalVisible(true);
+  };
+
+  const openBatchDetails = (batch: Batch) => {
     setSelectedBatch(batch);
-    setModalVisible(true);
+    setLoteModalVisible(true);
   };
 
   if (loading && batches.length === 0) {
@@ -465,32 +603,69 @@ const ModulesScreen = () => {
   return (
     <View style={styles.screen}>
       <View style={styles.syncHeader}>
-        <Text style={styles.syncTitle}>Lotes finalizados</Text>
+        <Text style={styles.syncTitle}>Usinas</Text>
         <Button title="Sincronizar" onPress={() => syncPendingBatches()} />
       </View>
+
       <FlatList
-        data={batches}
-        keyExtractor={(item, index) => item.id || index.toString()}
-        renderItem={({ item }) => (
-          <View style={[styles.card, !item.synced && styles.pendingCard]}>
-            <Text style={styles.cardTitle}>
-              Lote {item.batchId} {!item.synced && '⏳ (pendente)'}
-            </Text>
-            <Text style={styles.cardSubtitle}>
-              {item.modules.length} módulos • Criado em {item.createdAt}
-            </Text>
-            <Button title="Detalhes" onPress={() => openDetails(item)} />
-          </View>
-        )}
+        data={USINAS}
+        keyExtractor={(item) => item}
+        renderItem={({ item: usina }) => {
+          const lotesDaUsina = batches.filter((b) => b.usina === usina);
+          const totalModulos = lotesDaUsina.reduce(
+            (sum, b) => sum + b.modules.length, 0
+          );
+          const totalLotes = lotesDaUsina.length;
+
+          return (
+            <View style={styles.usinaCard}>
+              <View style={styles.usinaHeader}>
+                <Text style={styles.usinaTitle}>{usina}</Text>
+                <Text style={styles.usinaStats}>
+                  {totalLotes} lote(s) • {totalModulos} módulo(s)
+                </Text>
+              </View>
+              <Button title="Ver lotes" onPress={() => openUsinaLotes(usina)} />
+            </View>
+          );
+        }}
         ListEmptyComponent={
-          <Text style={styles.emptyText}>
-            Nenhum lote finalizado ainda. Vá para "Registrar lote" e complete um lote de 30.
-          </Text>
+          <Text style={styles.emptyText}>Nenhuma usina disponível.</Text>
         }
       />
-      <Modal visible={modalVisible} animationType="slide" onRequestClose={() => setModalVisible(false)}>
+
+      <Modal visible={usinaModalVisible} animationType="slide" onRequestClose={() => setUsinaModalVisible(false)}>
         <View style={styles.modalContainer}>
-          <Text style={styles.modalTitle}>Detalhes do Lote {selectedBatch?.batchId}</Text>
+          <Text style={styles.modalTitle}>Lotes de {selectedUsina}</Text>
+          {batchesDaUsina.length === 0 ? (
+            <Text style={styles.emptyText}>Nenhum lote encontrado.</Text>
+          ) : (
+            <FlatList
+              data={batchesDaUsina}
+              keyExtractor={(item, index) => item.id || index.toString()}
+              renderItem={({ item }) => (
+                <View style={[styles.card, !item.synced && styles.pendingCard]}>
+                  <Text style={styles.cardTitle}>
+                    {item.subarea} – Lote {item.batchId}
+                    {!item.synced && ' ⏳'}
+                  </Text>
+                  <Text style={styles.cardSubtitle}>
+                    {item.modules.length} módulos • {item.createdAt}
+                  </Text>
+                  <Button title="Detalhes" onPress={() => openBatchDetails(item)} />
+                </View>
+              )}
+            />
+          )}
+          <View style={{ marginTop: 12 }}>
+            <Button title="Fechar" onPress={() => setUsinaModalVisible(false)} />
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={loteModalVisible} animationType="slide" onRequestClose={() => setLoteModalVisible(false)}>
+        <View style={styles.modalContainer}>
+          <Text style={styles.modalTitle}>Lote {selectedBatch?.batchId} ({selectedBatch?.subarea})</Text>
           <FlatList
             data={selectedBatch?.modules}
             keyExtractor={(item) => item.id.toString()}
@@ -509,14 +684,16 @@ const ModulesScreen = () => {
               </View>
             )}
           />
-          <Button title="Fechar" onPress={() => setModalVisible(false)} />
+          <View style={{ marginTop: 12 }}>
+            <Button title="Fechar" onPress={() => setLoteModalVisible(false)} />
+          </View>
         </View>
       </Modal>
     </View>
   );
 };
 
-// ---------- Navegação ----------
+// ==================== NAVEGAÇÃO ====================
 const Tab = createBottomTabNavigator();
 const AppNavigator = () => (
   <Tab.Navigator
@@ -533,7 +710,6 @@ const AppNavigator = () => (
   </Tab.Navigator>
 );
 
-// ---------- App principal ----------
 export default function App() {
   return (
     <AppProvider>
@@ -544,12 +720,20 @@ export default function App() {
   );
 }
 
-// ---------- Estilos ----------
+// ==================== ESTILOS ====================
 const styles = StyleSheet.create({
   screen: { flex: 1, padding: 16, backgroundColor: '#f5f5f5' },
   loadingContainer: { flex: 1, justifyContent: 'center', alignItems: 'center' },
   syncHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
   syncTitle: { fontSize: 18, fontWeight: 'bold' },
+  label: { fontSize: 16, fontWeight: 'bold', marginTop: 8, marginBottom: 4 },
+  pickerContainer: {
+    borderWidth: 1,
+    borderColor: '#ccc',
+    borderRadius: 8,
+    backgroundColor: '#fff',
+    marginBottom: 12,
+  },
   headerRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -561,6 +745,7 @@ const styles = StyleSheet.create({
     elevation: 2,
   },
   batchLabel: { fontSize: 16, fontWeight: 'bold', color: '#1976d2' },
+  usinaLabel: { fontSize: 14, color: '#555' },
   counter: { fontSize: 16, fontWeight: 'bold' },
   codeInputContainer: { flexDirection: 'row', marginBottom: 20, gap: 8 },
   codeInput: { flex: 1, borderWidth: 1, borderColor: '#ccc', borderRadius: 8, padding: 8, backgroundColor: '#fff' },
@@ -578,4 +763,25 @@ const styles = StyleSheet.create({
   emptyText: { textAlign: 'center', marginTop: 40, fontSize: 16, color: '#888' },
   modalContainer: { flex: 1, padding: 20, backgroundColor: '#fff' },
   modalTitle: { fontSize: 22, fontWeight: 'bold', marginBottom: 20, textAlign: 'center' },
+  // Novos estilos para usinas
+  usinaCard: {
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 12,
+    elevation: 3,
+  },
+  usinaHeader: {
+    marginBottom: 8,
+  },
+  usinaTitle: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#1976d2',
+  },
+  usinaStats: {
+    fontSize: 14,
+    color: '#555',
+    marginTop: 4,
+  },
 });
