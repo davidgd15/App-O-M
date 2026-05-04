@@ -15,7 +15,14 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { db } from './firebaseConfig';
-import { collection, query, orderBy, onSnapshot, addDoc } from 'firebase/firestore';
+import {
+  collection,
+  query,
+  orderBy,
+  onSnapshot,
+  doc,
+  setDoc,
+} from 'firebase/firestore';
 import NetInfo from '@react-native-community/netinfo';
 
 // ==================== CONSTANTES ====================
@@ -39,11 +46,9 @@ const MAX_MODULES: Record<string, number> = {
   'PARAOPEBA-2': 30,
 };
 
-// Gera o nome da coleção: GD-1-UFV-1, GD-1-UFV-2, etc.
 const getCollectionName = (usina: string, subarea: string) =>
   `${usina}-${subarea.replace(/ /g, '-')}`;
 
-// Lista de todas as coleções que serão escutadas
 const ALL_COLLECTIONS = USINAS.flatMap((usina) =>
   SUBAREAS[usina].map((sub) => getCollectionName(usina, sub))
 );
@@ -110,7 +115,6 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [currentMaxModules, setCurrentMaxModules] = useState(0);
   const [loading, setLoading] = useState(true);
 
-  // Carrega cache local
   useEffect(() => {
     const loadLocalData = async () => {
       try {
@@ -126,7 +130,6 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     loadLocalData();
   }, []);
 
-  // Escuta TODAS as coleções (usina+subárea)
   useEffect(() => {
     const unsubscribes: (() => void)[] = [];
 
@@ -149,7 +152,6 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
         });
 
         setBatches((prev) => {
-          // Remove lotes sincronizados dessa coleção e insere os novos
           const other = prev.filter(
             (b) =>
               getCollectionName(b.usina, b.subarea) !== collectionName ||
@@ -176,15 +178,16 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     };
   }, []);
 
-  // Salvar lote na coleção correta
+  // Salvar lote com setDoc (ID único) – não duplica
   const addBatch = async (batch: Batch) => {
     const netInfo = await NetInfo.fetch();
     const isConnected = netInfo.isConnected && netInfo.isInternetReachable;
     const collectionName = getCollectionName(batch.usina, batch.subarea);
+    const docId = `${batch.usina}-${batch.subarea}-${batch.batchId}`;
 
     if (isConnected) {
       try {
-        await addDoc(collection(db, collectionName), {
+        await setDoc(doc(db, collectionName, docId), {
           batchId: batch.batchId,
           usina: batch.usina,
           subarea: batch.subarea,
@@ -207,7 +210,7 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     Alert.alert('Salvo offline', 'Lote será sincronizado quando a conexão voltar.');
   };
 
-  // Sincronizar pendentes
+  // Sincronizar pendentes CORRIGIDO
   const syncPendingBatches = async (showAlert: boolean = true): Promise<void> => {
     const netInfo = await NetInfo.fetch();
     if (!netInfo.isConnected || !netInfo.isInternetReachable) {
@@ -220,11 +223,15 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
       if (showAlert) Alert.alert('Nada a sincronizar', 'Todos os lotes já estão no servidor.');
       return;
     }
+
     let successCount = 0;
+    const failed: Batch[] = [];
+
     for (const batch of pendingList) {
       try {
         const collectionName = getCollectionName(batch.usina, batch.subarea);
-        await addDoc(collection(db, collectionName), {
+        const docId = `${batch.usina}-${batch.subarea}-${batch.batchId}`;
+        await setDoc(doc(db, collectionName, docId), {
           batchId: batch.batchId,
           usina: batch.usina,
           subarea: batch.subarea,
@@ -235,14 +242,17 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
         successCount++;
       } catch (error) {
         console.error('Erro ao sincronizar lote:', batch.batchId, error);
+        failed.push(batch);
       }
     }
-    const remaining = pendingList.slice(successCount);
-    await AsyncStorage.setItem('@pending_batches', JSON.stringify(remaining));
-    if (showAlert) Alert.alert('Sincronização concluída', `${successCount} lote(s) enviado(s).`);
+
+    await AsyncStorage.setItem('@pending_batches', JSON.stringify(failed));
+
+    if (showAlert) {
+      Alert.alert('Sincronização concluída', `${successCount} lote(s) enviado(s).`);
+    }
   };
 
-  // Sincronização automática quando a internet voltar
   useEffect(() => {
     const unsubscribe = NetInfo.addEventListener((state) => {
       if (state.isConnected && state.isInternetReachable) {
@@ -252,14 +262,12 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     return () => unsubscribe();
   }, []);
 
-  // Criar novo lote (batchId por combinação usina+subárea)
   const createNewBatch = async (usina: string, sub: string, maxModules: number): Promise<boolean> => {
     if (currentBatchId !== null && currentModules.length > 0 && currentModules.length < currentMaxModules) {
       Alert.alert('Lote em andamento', 'Finalize ou cancele o lote atual antes de criar um novo.');
       return false;
     }
 
-    // batchId sequencial por usina+subárea (baseado no estado local)
     const relevant = batches.filter((b) => b.usina === usina && b.subarea === sub);
     let nextId = 1;
     if (relevant.length > 0) {
@@ -358,27 +366,37 @@ const CurrentBatchScreen = ({ navigation }: any) => {
   const [selectedUsina, setSelectedUsina] = useState('');
   const [selectedSub, setSelectedSub] = useState('');
   const [codeInput, setCodeInput] = useState('');
+  const [isFinalizing, setIsFinalizing] = useState(false);
   const inputRef = useRef<TextInput>(null);
 
   const isFull = currentBatchId !== null && currentModules.length >= currentMaxModules;
   const hasActiveBatch = currentBatchId !== null;
 
   const finalizeBatchWithModules = async (batchId: string, modules: Module[]) => {
-    const newBatch: Batch = {
-      batchId: batchId,
-      usina: currentUsina,
-      subarea: currentSub,
-      modules: modules,
-      createdAt: formatDateTime(new Date()),
-      synced: false,
-      maxModules: currentMaxModules,
-    };
-    await addBatch(newBatch);
-    resetCurrentBatch();
-    setSelectedUsina('');
-    setSelectedSub('');
-    Alert.alert('Lote salvo!', `Lote ${batchId} finalizado.`);
-    navigation.navigate('Módulos');
+    if (isFinalizing) return;
+    setIsFinalizing(true);
+    try {
+      const newBatch: Batch = {
+        batchId: batchId,
+        usina: currentUsina,
+        subarea: currentSub,
+        modules: modules,
+        createdAt: formatDateTime(new Date()),
+        synced: false,
+        maxModules: currentMaxModules,
+      };
+      await addBatch(newBatch);
+      resetCurrentBatch();
+      setSelectedUsina('');
+      setSelectedSub('');
+      Alert.alert('Lote salvo!', `Lote ${batchId} finalizado.`);
+      navigation.navigate('Módulos');
+    } catch (error) {
+      Alert.alert('Erro', 'Falha ao salvar lote.');
+      console.error(error);
+    } finally {
+      setIsFinalizing(false);
+    }
   };
 
   const handleAddCode = async () => {
@@ -515,16 +533,16 @@ const CurrentBatchScreen = ({ navigation }: any) => {
               keyboardType="numeric"
               maxLength={14}
               value={codeInput}
-              onChangeText={setCodeInput}
+              onChangeText={(text) => setCodeInput(text.replace(/[^0-9]/g, ''))}
               onSubmitEditing={handleAddCode}
             />
-            <Button title="Adicionar" onPress={handleAddCode} disabled={isFull} />
+            <Button title="Adicionar" onPress={handleAddCode} disabled={isFull || isFinalizing} />
           </View>
 
           <View style={styles.headerRow}>
             <Text style={styles.batchLabel}>Lote: {currentBatchId}</Text>
             <Text style={styles.usinaLabel}>{currentUsina} - {currentSub}</Text>
-            <Button title="Cancelar lote" onPress={handleCancelBatch} color="#d32f2f" />
+            <Button title="Cancelar lote" onPress={handleCancelBatch} color="#d32f2f" disabled={isFinalizing} />
           </View>
 
           <View style={styles.headerRow}>
@@ -560,7 +578,11 @@ const CurrentBatchScreen = ({ navigation }: any) => {
 
           {isFull && (
             <View style={styles.finishButton}>
-              <Button title="Finalizar Lote" onPress={() => finalizeBatchWithModules(currentBatchId!, currentModules)} />
+              <Button
+                title="Finalizar Lote"
+                onPress={() => finalizeBatchWithModules(currentBatchId!, currentModules)}
+                disabled={isFinalizing}
+              />
             </View>
           )}
         </>
@@ -763,7 +785,6 @@ const styles = StyleSheet.create({
   emptyText: { textAlign: 'center', marginTop: 40, fontSize: 16, color: '#888' },
   modalContainer: { flex: 1, padding: 20, backgroundColor: '#fff' },
   modalTitle: { fontSize: 22, fontWeight: 'bold', marginBottom: 20, textAlign: 'center' },
-  // Novos estilos para usinas
   usinaCard: {
     backgroundColor: '#fff',
     borderRadius: 12,
