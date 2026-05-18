@@ -22,8 +22,10 @@ import {
   onSnapshot,
   doc,
   setDoc,
+  getDocs,
 } from 'firebase/firestore';
 import NetInfo from '@react-native-community/netinfo';
+import { getAuth, signInAnonymously } from 'firebase/auth';
 
 // ==================== CONSTANTES ====================
 const USINAS = ['GD-1', 'GD-2', 'GD-3', 'GD-4', 'PARAOPEBA-1', 'PARAOPEBA-2'];
@@ -114,7 +116,24 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [currentSub, setCurrentSub] = useState('');
   const [currentMaxModules, setCurrentMaxModules] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [authReady, setAuthReady] = useState(false);
 
+  // Autenticação anônima ao montar o Provider
+  useEffect(() => {
+    const auth = getAuth();
+    signInAnonymously(auth)
+      .then(() => {
+        console.log('Usuário autenticado anonimamente.');
+        setAuthReady(true);
+      })
+      .catch((error) => {
+        console.error('Erro na autenticação anônima:', error);
+        Alert.alert('Erro', 'Não foi possível conectar ao servidor.');
+        setLoading(false); // evita loading infinito
+      });
+  }, []);
+
+  // Carregar cache local enquanto a autenticação não termina
   useEffect(() => {
     const loadLocalData = async () => {
       try {
@@ -130,53 +149,63 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     loadLocalData();
   }, []);
 
+  // Listeners do Firestore – só iniciam após autenticação
   useEffect(() => {
+    if (!authReady) return;
+
     const unsubscribes: (() => void)[] = [];
 
     ALL_COLLECTIONS.forEach((collectionName) => {
       const q = query(collection(db, collectionName), orderBy('createdAt', 'desc'));
-      const unsubscribe = onSnapshot(q, async (snapshot) => {
-        const firestoreBatches: Batch[] = [];
-        snapshot.forEach((doc) => {
-          const data = doc.data();
-          firestoreBatches.push({
-            id: doc.id,
-            batchId: data.batchId,
-            usina: data.usina,
-            subarea: data.subarea,
-            modules: data.modules,
-            createdAt: data.createdAt,
-            synced: true,
-            maxModules: data.maxModules,
+      const unsubscribe = onSnapshot(
+        q,
+        async (snapshot) => {
+          const firestoreBatches: Batch[] = [];
+          snapshot.forEach((doc) => {
+            const data = doc.data();
+            firestoreBatches.push({
+              id: doc.id,
+              batchId: data.batchId,
+              usina: data.usina,
+              subarea: data.subarea,
+              modules: data.modules,
+              createdAt: data.createdAt,
+              synced: true,
+              maxModules: data.maxModules,
+            });
           });
-        });
 
-        setBatches((prev) => {
-          const other = prev.filter(
-            (b) =>
-              getCollectionName(b.usina, b.subarea) !== collectionName ||
-              !b.synced
-          );
-          const merged = [...other, ...firestoreBatches];
-          AsyncStorage.setItem(
-            '@batches_cache',
-            JSON.stringify(merged.filter((b) => b.synced))
-          );
-          return merged.sort(
-            (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-          );
-        });
+          setBatches((prev) => {
+            const other = prev.filter(
+              (b) =>
+                getCollectionName(b.usina, b.subarea) !== collectionName ||
+                !b.synced
+            );
+            const merged = [...other, ...firestoreBatches];
+            AsyncStorage.setItem(
+              '@batches_cache',
+              JSON.stringify(merged.filter((b) => b.synced))
+            );
+            return merged.sort(
+              (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+            );
+          });
 
-        setLoading(false);
-      });
-
+          setLoading(false);
+        },
+        (error) => {
+          console.error('Erro no listener do Firestore:', error);
+          setLoading(false); // não trava a interface
+          Alert.alert('Erro', 'Falha ao carregar dados do servidor.');
+        }
+      );
       unsubscribes.push(unsubscribe);
     });
 
     return () => {
       unsubscribes.forEach((unsub) => unsub());
     };
-  }, []);
+  }, [authReady]);
 
   // Salvar lote com setDoc (ID único) – não duplica
   const addBatch = async (batch: Batch) => {
@@ -263,25 +292,45 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   }, []);
 
   const createNewBatch = async (usina: string, sub: string, maxModules: number): Promise<boolean> => {
-    if (currentBatchId !== null && currentModules.length > 0 && currentModules.length < currentMaxModules) {
-      Alert.alert('Lote em andamento', 'Finalize ou cancele o lote atual antes de criar um novo.');
-      return false;
-    }
+  // Verifica se há lote em andamento (mantido igual)
+  if (currentBatchId !== null && currentModules.length > 0 && currentModules.length < currentMaxModules) {
+    Alert.alert('Lote em andamento', 'Finalize ou cancele o lote atual antes de criar um novo.');
+    return false;
+  }
 
-    const relevant = batches.filter((b) => b.usina === usina && b.subarea === sub);
-    let nextId = 1;
+  let nextId = 1;
+  try {
+    // Consulta direta ao Firestore: pega o último lote da coleção, ordenado por batchId decrescente
+    const collectionName = getCollectionName(usina, sub);
+    const q = query(collection(db, collectionName), orderBy('batchId', 'desc'));
+    const snapshot = await getDocs(q); // você precisará importar getDocs, se já não estiver
+
+    if (!snapshot.empty) {
+      // Pega o batchId do primeiro documento (o maior)
+      const lastDoc = snapshot.docs[0].data();
+      const lastId = parseInt(lastDoc.batchId, 10);
+      if (!isNaN(lastId)) {
+        nextId = lastId + 1;
+      }
+    }
+  } catch (error) {
+    // Se falhar a consulta (ex.: offline), use o estado local como fallback
+    console.warn('Não foi possível consultar o Firestore, usando estado local:', error);
+    const relevant = batches.filter(b => b.usina === usina && b.subarea === sub);
     if (relevant.length > 0) {
-      const ids = relevant.map((b) => parseInt(b.batchId, 10)).filter((id) => !isNaN(id));
+      const ids = relevant.map(b => parseInt(b.batchId, 10)).filter(id => !isNaN(id));
       if (ids.length > 0) nextId = Math.max(...ids) + 1;
     }
+  }
 
-    setCurrentBatchId(nextId.toString());
-    setCurrentUsina(usina);
-    setCurrentSub(sub);
-    setCurrentMaxModules(maxModules);
-    setCurrentModules([]);
-    return true;
-  };
+  setCurrentBatchId(nextId.toString());
+  setCurrentUsina(usina);
+  setCurrentSub(sub);
+  setCurrentMaxModules(maxModules);
+  setCurrentModules([]);
+  return true;
+};
+
 
   const addModuleToCurrentBatch = async (code: string): Promise<boolean> => {
     if (currentBatchId === null) {
