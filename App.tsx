@@ -291,8 +291,8 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     return () => unsubscribe();
   }, []);
 
-  const createNewBatch = async (usina: string, sub: string, maxModules: number): Promise<boolean> => {
-  // Verifica se há lote em andamento (mantido igual)
+const createNewBatch = async (usina: string, sub: string, maxModules: number): Promise<boolean> => {
+  // Verifica se há lote em andamento
   if (currentBatchId !== null && currentModules.length > 0 && currentModules.length < currentMaxModules) {
     Alert.alert('Lote em andamento', 'Finalize ou cancele o lote atual antes de criar um novo.');
     return false;
@@ -300,22 +300,22 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
 
   let nextId = 1;
   try {
-    // Consulta direta ao Firestore: pega o último lote da coleção, ordenado por batchId decrescente
+    // Busca TODOS os documentos da coleção (sem orderBy)
     const collectionName = getCollectionName(usina, sub);
-    const q = query(collection(db, collectionName), orderBy('batchId', 'desc'));
-    const snapshot = await getDocs(q); // você precisará importar getDocs, se já não estiver
-
+    const snapshot = await getDocs(collection(db, collectionName));
+    
     if (!snapshot.empty) {
-      // Pega o batchId do primeiro documento (o maior)
-      const lastDoc = snapshot.docs[0].data();
-      const lastId = parseInt(lastDoc.batchId, 10);
-      if (!isNaN(lastId)) {
-        nextId = lastId + 1;
+      // Converte batchId para número e encontra o maior
+      const ids = snapshot.docs
+        .map(doc => parseInt(doc.data().batchId, 10))
+        .filter(id => !isNaN(id));
+      if (ids.length > 0) {
+        nextId = Math.max(...ids) + 1;
       }
     }
   } catch (error) {
-    // Se falhar a consulta (ex.: offline), use o estado local como fallback
-    console.warn('Não foi possível consultar o Firestore, usando estado local:', error);
+    // Fallback: usa estado local em caso de erro
+    console.warn('Erro ao consultar Firestore, usando estado local:', error);
     const relevant = batches.filter(b => b.usina === usina && b.subarea === sub);
     if (relevant.length > 0) {
       const ids = relevant.map(b => parseInt(b.batchId, 10)).filter(id => !isNaN(id));
