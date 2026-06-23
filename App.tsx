@@ -127,9 +127,10 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
         setAuthReady(true);
       })
       .catch((error) => {
-        console.error('Erro na autenticação anônima:', error);
-        Alert.alert('Erro', 'Não foi possível conectar ao servidor.');
-        setLoading(false); // evita loading infinito
+        console.warn('Autenticação falhou (offline?), continuando offline:', error);
+        // Mesmo sem autenticação, permite uso offline
+        setAuthReady(true);  // <- importante!
+        setLoading(false);
       });
   }, []);
 
@@ -299,27 +300,61 @@ const createNewBatch = async (usina: string, sub: string, maxModules: number): P
   }
 
   let nextId = 1;
-  try {
-    // Busca TODOS os documentos da coleção (sem orderBy)
-    const collectionName = getCollectionName(usina, sub);
-    const snapshot = await getDocs(collection(db, collectionName));
+  
+  // Verifica conexão antes de decidir a estratégia
+  const netInfo = await NetInfo.fetch();
+  let isConnected = netInfo.isConnected && netInfo.isInternetReachable;
+
+  if (isConnected) {
+    // ONLINE: consulta Firestore
+    try {
+      const collectionName = getCollectionName(usina, sub);
+      const snapshot = await getDocs(collection(db, collectionName));
+      
+      if (!snapshot.empty) {
+        const ids = snapshot.docs
+          .map(doc => parseInt(doc.data().batchId, 10))
+          .filter(id => !isNaN(id));
+        if (ids.length > 0) {
+          nextId = Math.max(...ids) + 1;
+        }
+      }
+    } catch (error) {
+      console.warn('Erro ao consultar Firestore, usando fallback local:', error);
+      // Se falhar mesmo online, usa fallback local
+      isConnected = false; // força fallback
+    }
+  }
+  
+  if (!isConnected) {
+    // OFFLINE (ou fallback): combina estado local + pendentes do AsyncStorage
+    // 1. Lotes já no estado (inclui pendentes adicionados recentemente)
+    const relevantFromState = batches.filter(b => b.usina === usina && b.subarea === sub);
     
-    if (!snapshot.empty) {
-      // Converte batchId para número e encontra o maior
-      const ids = snapshot.docs
-        .map(doc => parseInt(doc.data().batchId, 10))
-        .filter(id => !isNaN(id));
+    // 2. Pendentes salvos no AsyncStorage (para máxima segurança)
+    let pendingFromStorage: Batch[] = [];
+    try {
+      const stored = await AsyncStorage.getItem('@pending_batches');
+      if (stored) {
+        pendingFromStorage = JSON.parse(stored).filter(
+          (b: Batch) => b.usina === usina && b.subarea === sub
+        );
+      }
+    } catch (e) {}
+    
+    // Combina ambos, removendo duplicatas (pelo batchId)
+    const allLocal = [...relevantFromState];
+    pendingFromStorage.forEach(p => {
+      if (!allLocal.some(b => b.batchId === p.batchId)) {
+        allLocal.push(p);
+      }
+    });
+    
+    if (allLocal.length > 0) {
+      const ids = allLocal.map(b => parseInt(b.batchId, 10)).filter(id => !isNaN(id));
       if (ids.length > 0) {
         nextId = Math.max(...ids) + 1;
       }
-    }
-  } catch (error) {
-    // Fallback: usa estado local em caso de erro
-    console.warn('Erro ao consultar Firestore, usando estado local:', error);
-    const relevant = batches.filter(b => b.usina === usina && b.subarea === sub);
-    if (relevant.length > 0) {
-      const ids = relevant.map(b => parseInt(b.batchId, 10)).filter(id => !isNaN(id));
-      if (ids.length > 0) nextId = Math.max(...ids) + 1;
     }
   }
 
